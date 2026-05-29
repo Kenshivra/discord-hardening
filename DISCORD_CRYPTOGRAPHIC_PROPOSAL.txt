@@ -1,0 +1,329 @@
+Cryptographic Architecture Proposal for Discord
+Independent Security Research — May 2026
+
+--
+
+Discord shipped DAVE in March 2026. Voice and video are now end-to-end
+encrypted across every call type — DMs, group DMs, voice channels, Go
+Live. It uses MLS (RFC 9420), which is the right choice: formally
+specified, IETF standardised, with native forward secrecy and
+post-compromise security. Deploying it simultaneously across iOS,
+Android, web, Windows, macOS, and console is real engineering. It
+deserves to be said plainly.
+
+What follows is not a criticism of what Discord has built. It is a
+precise description of what remains open, and a concrete proposal for
+each problem — grounded in cryptographic primitives that exist today,
+have been deployed at scale elsewhere, and are auditable.
+
+--
+
+The open problems
+
+The text layer has no end-to-end encryption. Every direct message,
+every group DM, every server message is readable by Discord and by
+any employee with sufficient access. Discord holds the master
+decryption keys. This is not negligence — it is a deliberate
+architectural trade-off that enables moderation, search, link
+previews, and bots. The trade-off is real. So is the exposure.
+
+Authentication tokens are static bearer credentials with no
+cryptographic binding to the device that created them. A token
+extracted from local storage — Electron stores them in LevelDB,
+accessible in plaintext without elevated privileges — grants full
+account access indefinitely, bypassing both password and two-factor
+authentication. This is the dominant attack vector against Discord
+accounts in 2025-2026. Entire malware families are built around it.
+
+Metadata collection is unrestricted. IP address at every connection,
+message timestamp, server membership, communication frequency,
+device model, operating system, screen resolution, active
+applications via Rich Presence. This data is stored in plaintext.
+Metadata patterns are frequently more sensitive than message content
+— they reveal relationships, schedules, and associations that
+content alone does not.
+
+In September 2025, a third-party support vendor was compromised.
+Discord's own figures: 5.5 million users affected, approximately
+70,000 government ID images exposed. The attackers claimed 2.1
+million IDs — Discord disputes that figure. The precise number is
+less important than the structural cause: the vendor had persistent,
+broad access to user data in plaintext. A breach of the vendor was
+equivalent to a breach of Discord's data.
+
+Age verification requires submitting government identity documents
+to third-party processors. This creates a centralised database of
+identity documents with no cryptographic reason to exist. The
+September 2025 breach demonstrated exactly what happens when it does.
+
+--
+
+Proposed solutions
+
+-- Direct message encryption
+
+Private conversations between two people have no legitimate reason
+to be readable by a third party. The moderation argument — the
+reason Discord gives for not implementing E2EE on text — applies
+to public server channels, not to private exchanges. These are
+categorically different surfaces and should be treated as such.
+
+Signal Protocol solves this. It is open source, formally verified
+(Cohn-Gordon et al., 2020, IEEE Security & Privacy), and deployed
+by WhatsApp for over two billion users without architectural collapse.
+
+Session establishment uses Extended Triple Diffie-Hellman (X3DH).
+Each party holds a long-term identity keypair (IK), a signed medium-
+term prekey (SPK), and a set of one-time prekeys (OPK). The initiator
+generates a fresh ephemeral keypair (EK) per session. The shared
+secret is derived from four independent DH operations:
+
+  DH1 = DH(IK_sender,  SPK_recipient)
+  DH2 = DH(EK_sender,  IK_recipient)
+  DH3 = DH(EK_sender,  SPK_recipient)
+  DH4 = DH(EK_sender,  OPK_recipient)
+  SK  = KDF(DH1 || DH2 || DH3 || DH4)
+
+No single key compromise breaks the session secret. DH1 provides
+mutual authentication. DH2 and DH3 provide forward secrecy. DH4,
+when a one-time prekey is available, provides additional protection
+against replay of the initial handshake. OPK is optional — the
+protocol degrades gracefully when the supply is exhausted.
+
+Once the session is open, every message is encrypted with a unique
+key produced by a ratcheting chain:
+
+  message_key    = KDF(chain_key, 0x01)
+  chain_key_next = KDF(chain_key, 0x02)
+  ciphertext     = AEAD(message_key, plaintext, associated_data)
+
+Forward secrecy and post-compromise security hold simultaneously.
+A key leaked today reveals nothing about past messages. After the
+next Diffie-Hellman ratchet step, it reveals nothing about future
+messages either.
+
+The implementation boundary for Discord is clean: E2EE applies to
+DMs and group DMs. Public server channels remain as they are —
+Discord can continue to moderate, search, and serve bots on server
+content without any modification. The two surfaces are independent.
+Prekeys are published to Discord's existing infrastructure. No
+separate public key directory is required.
+
+-- Token authentication
+
+The current model treats a token as a secret that grants access.
+Architecturally, it is equivalent to a password that never expires,
+cannot be changed by the user, and is stored on disk in a location
+accessible to any process running as the same user.
+
+The correct model is challenge-response using asymmetric
+cryptography, standardised by the W3C as WebAuthn and by the FIDO
+Alliance as FIDO2. It is already deployed by Google, Apple,
+Microsoft, and GitHub.
+
+At login, the device generates an asymmetric keypair. The private
+key is stored in the device's Trusted Platform Module or Secure
+Enclave — hardware architecturally designed to resist extraction
+even by processes with administrative privileges. The public key
+is registered with Discord.
+
+  device generates: (sk, pk) — P-256 or Ed25519
+  Discord stores:   pk
+  sk never leaves the device
+
+Every subsequent API request is authenticated by signing a fresh
+server-issued challenge:
+
+  proof = SIGN(sk, HASH(request) || server_nonce || timestamp)
+
+Discord verifies the signature against the stored public key.
+Extracting the token file from disk yields a public key — useless
+without the private key, which has never left the TPM.
+
+Google's internal deployment data for passkeys shows a reduction
+of over 99% in credential-based account takeovers for enrolled
+users. The technology is standardised, audited, and works at scale.
+
+For bots, which operate without a TPM: automatic token rotation
+every 24 hours, with immediate revocation triggered by behavioural
+anomaly — geographic inconsistency, request volume outside baseline,
+or a request signed by an unregistered device fingerprint.
+
+-- Metadata reduction
+
+Discord currently logs raw IP addresses with every request,
+message, and connection event. The IP is necessary for network
+routing. It is not necessary in application-layer logs.
+
+A rotating salt approach removes the long-term value of stored IPs
+without reducing the ability to detect abuse in real time:
+
+  daily_salt   = CSPRNG(32 bytes), rotated at midnight UTC
+  stored_value = BLAKE3(ip_address || daily_salt)
+
+Within a 24-hour window, the hash allows correlation — the same
+IP produces the same hash, supporting rate limiting and abuse
+detection. After salt rotation, no stored value can be reversed.
+Logs older than one day become anonymised without deletion.
+
+For direct message metadata — who communicates with whom — Sealed
+Sender, deployed by Signal in 2018, removes sender visibility from
+the server entirely:
+
+  inner_envelope = ENCRYPT(recipient_pk, {sender_certificate, message})
+  outer_envelope = ENCRYPT(server_pk,    {inner_envelope})
+
+The server decrypts the outer layer to determine routing. It never
+sees the inner layer and never learns who sent the message. Only
+the recipient identifies the sender from the certificate embedded
+in the inner envelope.
+
+Combined with DM encryption, the server knows a message arrived
+for a recipient. It knows nothing about who sent it or what it
+contained.
+
+-- Age verification without identity storage
+
+Verifying that a user is over 18 requires confirming that a birth
+date satisfies a threshold. It does not require storing a passport,
+a driving licence, or any other identity document. The September
+2025 breach made the cost of conflating these two things concrete.
+
+A cryptographic commitment scheme separates them. The user commits
+to their birth date using a random blinding factor:
+
+  commitment = BLAKE3("discord-age-verify/v1/commitment" || birth_date || blinding)
+
+The commitment is hiding: it reveals nothing about the birth date.
+It is binding: the committed value cannot be changed after the fact.
+The user proves that the committed date satisfies the age threshold
+by revealing birth_date and blinding. Discord verifies by
+recomputing the commitment independently and checking the age.
+
+A working implementation is included in poc/src/main.rs. One
+limitation is stated plainly: this is an interactive commitment
+scheme, not a zero-knowledge proof in the strict sense. The verifier
+receives birth_date and blinding to reconstruct the commitment. A
+strict ZKP — Groth16 or PLONK over an arithmetic circuit — would
+allow the verifier to check a 192-byte proof without receiving any
+private input. The distinction matters and is not elided here.
+
+  Current PoC:
+    The verifier receives birth_date and blinding_factor.
+    Not zero-knowledge — verifier learns the private input.
+    No trusted setup required.
+
+  Production ZKP (Groth16 over BN254):
+    Proof size: 192 bytes, fixed regardless of input.
+    Verifier sees the proof only. No private inputs transmitted.
+    Trusted setup required — or PLONK for a universal setup.
+
+The production path: Circom 2.0 or arkworks as circuit compiler,
+BN254 or BLS12-381 as the curve. Semaphore and Anon Aadhaar are
+open-source reference implementations of this exact pattern, both
+production-deployed.
+
+In either case — commitment scheme or full ZKP — no identity
+document is stored. A breach of the age verification system yields
+nothing, because nothing is kept.
+
+-- Third-party data compartmentalisation
+
+The September 2025 incident was not a breach of Discord's own
+infrastructure. It was a breach of a support vendor with persistent,
+broad access to user data in plaintext. The structural fix is to
+ensure vendor access is cryptographically scoped — limited to the
+data required for one active ticket, for the duration of that ticket.
+
+Per-ticket encryption with time-limited derived keys:
+
+  prk        = HKDF-Extract(master_salt, vendor_id || ticket_id || expiry_unix)
+  ticket_key = HKDF-Expand(prk, "discord/v1/support-ticket", 32)
+  ciphertext = ChaCha20-Poly1305(ticket_key, support_data)
+
+The vendor receives the ciphertext and a ticket_key valid only for
+that ticket's lifetime. When the ticket closes, the key is not
+renewed. The vendor cannot read its own previous sessions without
+a current derived key. A breach exposes only currently open tickets
+— not 8.4 million historical ones.
+
+Government ID images specifically should not be stored at all. The
+commitment scheme above makes storage unnecessary. A system that
+does not collect identity documents cannot lose them.
+
+--
+
+What is not proposed here
+
+Fully Homomorphic Encryption for moderation on encrypted server
+messages is not a near-term proposal. Computing moderation decisions
+on ciphertext is mathematically possible. At Discord's scale — hundreds
+of millions of messages per day — the computational overhead is not
+within reach on any realistic hardware horizon for this decade. This
+document does not propose it.
+
+Oblivious RAM for hiding access patterns has the same constraint.
+MegaBlocks (ACM CCS 2025) advances the state of the art materially,
+but the per-access overhead remains impractical at Discord's scale.
+Worth monitoring as hardware improves.
+
+Multi-party computation for distributed moderation requires
+infrastructure restructuring well beyond the scope of cryptographic
+primitives. Not proposed here.
+
+--
+
+Priority and timeline
+
+  Token binding via WebAuthn/FIDO2             3 to 6 months
+  IP hashing with rotating daily salt          4 weeks
+  Commitment scheme for age verification       available now
+  E2EE for DMs and group DMs                  6 to 12 months
+  Vendor key compartmentalisation              6 to 12 months
+  Sealed Sender for DMs                        12 to 18 months
+  Production ZKP for age verification          12 to 18 months
+
+--
+
+References
+
+Cohn-Gordon, K., Cremers, C., Dowling, B., Garratt, L., Stebila, D.
+  (2020). A Formal Security Analysis of the Signal Messaging Protocol.
+  IEEE European Symposium on Security and Privacy.
+
+Marlinspike, M., Perrin, T. (2016). The X3DH Key Agreement Protocol.
+  Signal Foundation.
+
+Marlinspike, M., Perrin, T. (2016). The Double Ratchet Algorithm.
+  Signal Foundation.
+
+Barnes, R., Beurdouche, B., Robert, R., Millican, J., Omara, E.,
+  Cohn-Gordon, K. (2023). RFC 9420 — The Messaging Layer Security
+  Protocol. IETF.
+
+W3C Web Authentication (WebAuthn) Level 3. W3C Recommendation, 2025.
+
+FIDO Alliance. Client to Authenticator Protocol (CTAP) 2.2. 2024.
+
+Groth, J. (2016). On the Size of Pairing-Based Non-interactive
+  Arguments. Eurocrypt 2016. LNCS 9666.
+
+Bernstein, D.J. (2006). Curve25519: New Diffie-Hellman Speed Records.
+  Public Key Cryptography — PKC 2006. LNCS 3958.
+
+Semaphore. Zero-knowledge group membership protocol.
+  Ethereum Foundation, 2023. github.com/semaphore-protocol
+
+Anon Aadhaar. ZKP-based identity verification without data exposure.
+  Privacy and Scaling Explorations, 2024.
+
+Asharov, G., Komargodski, I., Lin, W., Peserico, E., Shi, E. (2025).
+  MegaBlocks: Breaking the Logarithmic I/O-Overhead Barrier for ORAM.
+  ACM CCS 2025.
+
+BleepingComputer (October 2025). Discord breach via third-party support
+  vendor exposed data of 5.5 million users.
+
+Discord (October 2025). Official statement on third-party support
+  system security incident.
+
